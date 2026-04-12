@@ -424,3 +424,163 @@ python-dotenv
 - **No Oracle Client needed** — `oracledb` thin mode works out of the box.
 - **Extend the system prompt** in `agent.py` with your specific table names or domain context to improve query accuracy.
 - **Add tools** by defining new `@tool` functions in `tools.py` and appending them to `ALL_TOOLS`.
+
+
+## Conversation Memory
+
+`create_agent` supports memory natively via the `checkpointer` parameter. Pass a checkpointer and a `thread_id` in the config on every invoke — the agent automatically loads and saves the full message history per thread.
+
+---
+
+### `agent.py`
+
+```python
+import os
+
+from dotenv import load_dotenv
+from langchain.agents import create_agent
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
+
+from tools import ALL_TOOLS
+
+load_dotenv()
+
+
+SYSTEM_PROMPT = """You are an expert Oracle SQL assistant. Your job is to help users
+query an Oracle database by translating their natural language questions into correct
+Oracle SQL SELECT statements and returning clear, readable answers.
+
+Guidelines:
+- Always use list_tables first if you are unsure which tables exist.
+- Use describe_table to understand a table's columns before writing a query.
+- Use validate_query before run_sql_query when constructing complex queries.
+- Only run SELECT queries — never modify data.
+- If a user's question is ambiguous, ask for clarification before querying.
+- Present results in a clean, easy-to-read format.
+- Explain what query you ran and why.
+"""
+
+
+def build_agent():
+    """
+    Build and return a compiled LangChain agent graph using create_agent.
+
+    MemorySaver is passed as the checkpointer — it persists the full message
+    history in memory, keyed by thread_id. Each unique thread_id is an
+    independent conversation with its own history.
+    """
+    llm = ChatOpenAI(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        base_url=os.getenv("OPENAI_BASE_URL"),
+        api_key=os.getenv("OPENAI_API_KEY"),
+        temperature=0,
+    )
+
+    # MemorySaver stores conversation state in-process (RAM).
+    # Swap this for SqliteSaver or PostgresSaver for persistence across restarts.
+    checkpointer = MemorySaver()
+
+    graph = create_agent(
+        model=llm,
+        tools=ALL_TOOLS,
+        system_prompt=SYSTEM_PROMPT,
+        checkpointer=checkpointer,  # enables per-thread conversation memory
+        debug=True,
+    )
+
+    return graph
+```
+
+---
+
+### `main.py`
+
+```python
+import uuid
+
+from agent import build_agent
+
+
+def main():
+    print("=" * 60)
+    print("  Oracle SQL AI Agent — powered by LangChain + ChatOpenAI")
+    print("  Type your question in plain English. Type 'exit' to quit.")
+    print("=" * 60)
+
+    graph = build_agent()
+
+    # A unique thread_id scopes this session's memory.
+    # Every message in this session is stored and recalled under this ID.
+    # Change or generate a new thread_id to start a fresh conversation.
+    thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+
+    print(f"\n  Session ID: {thread_id}")
+    print("  (Conversation history is maintained for this session)\n")
+
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nGoodbye!")
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() in {"exit", "quit", "q"}:
+            print("Goodbye!")
+            break
+
+        try:
+            # Pass config with thread_id on every invoke so the checkpointer
+            # can load and save the message history for this conversation.
+            result = graph.invoke(
+                {"messages": [{"role": "user", "content": user_input}]},
+                config=config,
+            )
+            final_message = result["messages"][-1]
+            print(f"\nAgent: {final_message.content}\n")
+        except Exception as e:
+            print(f"\nError: {e}\n")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+### How it works
+
+| Concept | Detail |
+|---|---|
+| `MemorySaver` | In-memory checkpointer from LangGraph. Stores full message history per `thread_id`. |
+| `thread_id` | A UUID generated once per session. Scopes memory so each conversation is independent. |
+| `config` | Passed on every `.invoke()` call so the checkpointer loads prior history before each turn. |
+
+The agent can now handle follow-up questions naturally:
+
+```
+You: How many employees are in the SALES department?
+Agent: There are 24 employees in the SALES department.
+
+You: What are their names?        ← agent knows "their" = SALES employees
+Agent: Here are the 24 employees...
+```
+
+---
+
+### Persisting memory across restarts
+
+`MemorySaver` is in-memory only — history is lost if the process restarts. Swap it out in `agent.py` for persistence, with no other code changes needed:
+
+```python
+# SQLite — persists to a local file
+from langgraph.checkpoint.sqlite import SqliteSaver
+checkpointer = SqliteSaver.from_conn_string("memory.db")
+
+# Postgres — for production / multi-user setups
+from langgraph.checkpoint.postgres import PostgresSaver
+checkpointer = PostgresSaver.from_conn_string(os.getenv("DATABASE_URL"))
+```
